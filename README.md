@@ -3,7 +3,7 @@
 This fork targets a user-controlled iOS camera test app in LiveContainer. It is not a system-wide camera driver.
 
 ## Manual build
-The workflow supports manual dispatch in Actions → Build VCam → Run workflow. The source review commit skips CI; no build or device test has been performed for that commit. Download VCam-dylib after a successful manual build.
+The workflow supports manual dispatch in Actions → Build VCam → Run workflow. The initial source review commit skipped CI. The follow-up commit requests a CI build; device testing remains required. Minimum deployment target: iOS 16.0. Download VCam-dylib after a successful manual build.
 
 ## Test sequence
 1. Use a test app you control with AVCaptureVideoDataOutput; verify normal camera and UI without the plugin.

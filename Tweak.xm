@@ -4,6 +4,8 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <VideoToolbox/VideoToolbox.h>
+#import <VideoToolbox/VTPixelTransferSession.h>
+#import <VideoToolbox/VTPixelTransferProperties.h>
 #import <objc/runtime.h>
 #import "MediaManager.h"
 
@@ -64,6 +66,7 @@ static NSArray<UIWindow *> *windowsForOverlay(UIWindow *overlay) {
 
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
+    if (CGRectIsEmpty(self.view.bounds)) return;
     if (CGRectGetMinX(self.floatingButton.frame) == 0) {
         self.floatingButton.center = CGPointMake(CGRectGetWidth(self.view.bounds)-40, 125);
     }
