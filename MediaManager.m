@@ -1,224 +1,214 @@
 #import "MediaManager.h"
-#import <CoreImage/CoreImage.h>
+#import <QuartzCore/QuartzCore.h>
+#import <math.h>
 
 @interface MediaManager ()
-@property (nonatomic, strong) dispatch_queue_t decodeQueue;
-@property (nonatomic, assign) CMTime startTime;
-@property (nonatomic, assign) int64_t frameIndex;
+@property (atomic, readwrite) BOOL isRunning;
+@property (atomic, readwrite) BOOL hasVideo;
+@property (atomic, copy, readwrite, nullable) NSString *lastError;
 @end
 
-@implementation MediaManager
+@implementation MediaManager {
+    dispatch_queue_t _decodeQueue;
+    dispatch_source_t _timer;
+    NSURL *_fileURL;
+    AVAsset *_asset;
+    AVAssetReader *_reader;
+    AVAssetReaderOutput *_output;
+    CMSampleBufferRef _pending;
+    CVPixelBufferRef _latest;
+    CMTime _lastPTS;
+    CMTime _originPTS;
+    double _clockStart;
+    BOOL _clockActive;
+}
 
 + (instancetype)sharedManager {
     static MediaManager *instance;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        instance = [[MediaManager alloc] init];
-    });
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ instance = [[self alloc] init]; });
     return instance;
 }
 
 - (instancetype)init {
-    self = [super init];
-    if (self) {
-        _mode = VCamModeBlack;
-        _loopPlayback = YES;
-        _isRunning = NO;
-        _videoSize = CGSizeMake(1920, 1080);
+    if ((self = [super init])) {
         _decodeQueue = dispatch_queue_create("com.vcam.decode", DISPATCH_QUEUE_SERIAL);
-        _startTime = kCMTimeZero;
-        _frameIndex = 0;
+        _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _decodeQueue);
+        dispatch_source_set_timer(_timer, DISPATCH_TIME_NOW, NSEC_PER_SEC / 60, NSEC_PER_MSEC * 2);
+        __weak MediaManager *weakSelf = self;
+        dispatch_source_set_event_handler(_timer, ^{ [weakSelf tick]; });
+        dispatch_resume(_timer);
     }
     return self;
 }
 
-#pragma mark - Media Loading
+- (NSError *)errorWithMessage:(NSString *)message {
+    return [NSError errorWithDomain:@"com.vcam.media" code:1
+                            userInfo:@{NSLocalizedDescriptionKey: message}];
+}
 
-- (void)loadMediaFromURL:(NSURL *)url {
+- (void)clearLatest {
+    @synchronized (self) {
+        if (_latest) CVPixelBufferRelease(_latest);
+        _latest = NULL;
+    }
+}
+
+- (void)closeReader {
+    if (_pending) CFRelease(_pending);
+    _pending = NULL;
+    [_reader cancelReading];
+    _reader = nil;
+    _output = nil;
+    _clockActive = NO;
+}
+
+- (void)discardVideo {
+    self.isRunning = NO;
+    self.hasVideo = NO;
+    [self closeReader];
+    [self clearLatest];
+    _asset = nil;
+    if (_fileURL) [[NSFileManager defaultManager] removeItemAtURL:_fileURL error:NULL];
+    _fileURL = nil;
+}
+
+- (BOOL)openReader:(NSError **)error {
+    [self closeReader];
+    NSArray<AVAssetTrack *> *tracks = [_asset tracksWithMediaType:AVMediaTypeVideo];
+    if (!tracks.count) {
+        if (error) *error = [self errorWithMessage:@"视频没有可读取的视频轨道"];
+        return NO;
+    }
+    AVAssetTrack *track = tracks.firstObject;
+    _reader = [[AVAssetReader alloc] initWithAsset:_asset error:error];
+    if (!_reader) return NO;
+    NSDictionary *settings = @{
+        (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)
+    };
+    // Apply the source's display transform for portrait/rotated clips.
+    if (!CGAffineTransformIsIdentity(track.preferredTransform)) {
+        AVAssetReaderVideoCompositionOutput *output = [[AVAssetReaderVideoCompositionOutput alloc] initWithVideoTracks:@[track] videoSettings:settings];
+        output.videoComposition = [AVMutableVideoComposition videoCompositionWithPropertiesOfAsset:_asset];
+        _output = output;
+    } else {
+        _output = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
+    }
+    _output.alwaysCopiesSampleData = NO;
+    if (![_reader canAddOutput:_output]) {
+        if (error) *error = [self errorWithMessage:@"无法创建视频解码输出"];
+        [self closeReader];
+        return NO;
+    }
+    [_reader addOutput:_output];
+    if (![_reader startReading]) {
+        if (error) *error = _reader.error ?: [self errorWithMessage:@"视频解码启动失败"];
+        [self closeReader];
+        return NO;
+    }
+    return YES;
+}
+
+- (BOOL)publish:(CMSampleBufferRef)sample {
+    CVPixelBufferRef pixel = CMSampleBufferGetImageBuffer(sample);
+    if (!pixel) return NO;
+    CVPixelBufferRetain(pixel);
+    @synchronized (self) {
+        if (_latest) CVPixelBufferRelease(_latest);
+        _latest = pixel;
+    }
+    _lastPTS = CMSampleBufferGetPresentationTimeStamp(sample);
+    return YES;
+}
+
+- (BOOL)primeReader:(NSError **)error {
+    if (![self openReader:error]) return NO;
+    CMSampleBufferRef first = [_output copyNextSampleBuffer];
+    BOOL ok = first && [self publish:first];
+    if (first) CFRelease(first);
+    if (!ok) {
+        if (error) *error = _reader.error ?: [self errorWithMessage:@"视频没有可解码的帧"];
+        [self closeReader];
+        return NO;
+    }
+    _clockActive = NO;
+    return YES;
+}
+
+- (void)loadVideoAtURL:(NSURL *)url completion:(void (^)(NSError *))completion {
     dispatch_async(_decodeQueue, ^{
-        AVAsset *asset = [AVAsset assetWithURL:url];
-        if (!asset) return;
-        
-        self.currentAsset = asset;
-        self.videoDuration = asset.duration;
-        
-        // Get video dimensions
-        NSArray<AVAssetTrack *> *tracks = [asset tracksWithMediaType:AVMediaTypeVideo];
-        if (tracks.count > 0) {
-            AVAssetTrack *track = tracks.firstObject;
-            CGSize size = track.naturalSize;
-            CGAffineTransform t = track.preferredTransform;
-            size = CGSizeApplyAffineTransform(size, t);
-            size.width = fabs(size.width);
-            size.height = fabs(size.height);
-            if (size.width > 0 && size.height > 0) {
-                self.videoSize = size;
-            }
+        [self discardVideo];
+        self.lastError = nil;
+        self->_fileURL = url;
+        self->_asset = [AVURLAsset URLAssetWithURL:url options:nil];
+        NSError *error = nil;
+        if ([self primeReader:&error]) {
+            self.hasVideo = YES;
+        } else {
+            error = error ?: [self errorWithMessage:@"无法读取视频"];
+            self.lastError = error.localizedDescription;
+            [self discardVideo];
         }
-        
-        [self resetReaders];
-        self.mode = VCamModeVideo;
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(error); });
     });
 }
 
-- (void)resetReaders {
-    NSError *error = nil;
-    
-    // --- Video Reader ---
-    if (self.currentAsset) {
-        self.videoReader = [AVAssetReader assetReaderWithAsset:self.currentAsset error:&error];
-        
-        NSArray<AVAssetTrack *> *videoTracks = [self.currentAsset tracksWithMediaType:AVMediaTypeVideo];
-        if (videoTracks.count > 0) {
-            NSDictionary *settings = @{
-                (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
-            };
-            self.videoOutput = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:videoTracks.firstObject
-                                                                          outputSettings:settings];
-            self.videoOutput.alwaysCopiesSampleData = NO;
-            [self.videoReader addOutput:self.videoOutput];
-        }
-        
-        [self.videoReader startReading];
+- (void)tick {
+    if (!self.isRunning || !self.hasVideo) {
+        _clockActive = NO;
+        return;
     }
-    
-    // --- Audio Reader ---
-    if (self.currentAsset) {
-        self.audioReader = [AVAssetReader assetReaderWithAsset:self.currentAsset error:&error];
-        
-        NSArray<AVAssetTrack *> *audioTracks = [self.currentAsset tracksWithMediaType:AVMediaTypeAudio];
-        if (audioTracks.count > 0) {
-            NSDictionary *settings = @{
-                AVFormatIDKey: @(kAudioFormatLinearPCM),
-                AVSampleRateKey: @(44100),
-                AVNumberOfChannelsKey: @(1),
-                AVLinearPCMBitDepthKey: @(16),
-                AVLinearPCMIsFloatKey: @(NO),
-                AVLinearPCMIsBigEndianKey: @(NO),
-            };
-            self.audioOutput = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:audioTracks.firstObject
-                                                                          outputSettings:settings];
-            self.audioOutput.alwaysCopiesSampleData = NO;
-            [self.audioReader addOutput:self.audioOutput];
+    double now = CACurrentMediaTime();
+    if (!_clockActive) {
+        _clockStart = now;
+        _originPTS = _lastPTS;
+        _clockActive = YES;
+    }
+    // Bound work per tick. Decode on the serial queue, never the UI/camera queue.
+    for (NSUInteger i = 0; i < 8 && self.isRunning; i++) {
+        if (!_pending) _pending = [_output copyNextSampleBuffer];
+        if (!_pending) {
+            if (_reader.status == AVAssetReaderStatusCompleted) {
+                NSError *error = nil;
+                if ([self primeReader:&error]) return;
+                self.lastError = error.localizedDescription ?: @"循环播放失败";
+            } else if (_reader.status == AVAssetReaderStatusFailed ||
+                       _reader.status == AVAssetReaderStatusCancelled) {
+                self.lastError = _reader.error.localizedDescription ?: @"视频解码中断";
+            } else {
+                return;
+            }
+            [self discardVideo];
+            return;
         }
-        
-        [self.audioReader startReading];
+        double offset = CMTimeGetSeconds(CMTimeSubtract(CMSampleBufferGetPresentationTimeStamp(_pending), _originPTS));
+        if (isfinite(offset) && offset > now - _clockStart) return;
+        [self publish:_pending];
+        CFRelease(_pending);
+        _pending = NULL;
     }
 }
-
-#pragma mark - Frame Generation
-
-- (CMSampleBufferRef)nextVideoFrame {
-    if (self.mode != VCamModeVideo || !self.videoOutput) {
-        CMTime pts = CMTimeMakeWithSeconds(CACurrentMediaTime(), 1000000);
-        return [self generateBlackFrameWithSize:self.videoSize presentationTime:pts];
-    }
-    
-    CMSampleBufferRef sample = [self.videoOutput copyNextSampleBuffer];
-    
-    // Handle end-of-stream: loop
-    if (!sample) {
-        if (self.loopPlayback) {
-            [self resetReaders];
-            sample = [self.videoOutput copyNextSampleBuffer];
-        }
-        if (!sample) {
-            CMTime pts = CMTimeMakeWithSeconds(CACurrentMediaTime(), 1000000);
-            return [self generateBlackFrameWithSize:self.videoSize presentationTime:pts];
-        }
-    }
-    
-    // Re-timestamp to wall clock so AVCapture consumers see continuous PTS
-    CMTime now = CMTimeMakeWithSeconds(CACurrentMediaTime(), 1000000);
-    CMSampleBufferRef retimed = NULL;
-    CMSampleBufferRef copy = NULL;
-    
-    CMSampleBufferCreateCopy(kCFAllocatorDefault, sample, &copy);
-    if (copy) {
-        CMSampleBufferSetOutputPresentationTimeStamp(copy, now);
-        retimed = copy;
-    }
-    CFRelease(sample);
-    
-    return retimed;
-}
-
-- (CMSampleBufferRef)nextAudioFrame {
-    if (!self.audioOutput) return NULL;
-    
-    CMSampleBufferRef sample = [self.audioOutput copyNextSampleBuffer];
-    if (!sample && self.loopPlayback) {
-        // Audio reader reset handled separately if needed
-        return NULL;
-    }
-    return sample;
-}
-
-#pragma mark - Black Frame
-
-- (CMSampleBufferRef)generateBlackFrameWithSize:(CGSize)size presentationTime:(CMTime)pts {
-    CVPixelBufferRef pixelBuffer = NULL;
-    NSDictionary *attrs = @{
-        (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
-    };
-    CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault,
-                                          (size_t)size.width,
-                                          (size_t)size.height,
-                                          kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-                                          (__bridge CFDictionaryRef)attrs,
-                                          &pixelBuffer);
-    if (status != kCVReturnSuccess || !pixelBuffer) return NULL;
-    
-    // Fill with black (zero all planes)
-    CVPixelBufferLockBaseAddress(pixelBuffer, 0);
-    
-    void *yPlane = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0);
-    size_t yBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0);
-    size_t yHeight = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0);
-    memset(yPlane, 16, yBytesPerRow * yHeight);  // Y=16 for black in limited range, 0 for full
-    
-    void *uvPlane = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1);
-    size_t uvBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1);
-    size_t uvHeight = CVPixelBufferGetHeightOfPlane(pixelBuffer, 1);
-    memset(uvPlane, 128, uvBytesPerRow * uvHeight);  // UV=128 for neutral chroma
-    
-    CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
-    
-    // Create CMVideoFormatDescription
-    CMVideoFormatDescriptionRef formatDesc = NULL;
-    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &formatDesc);
-    
-    // Create CMSampleBuffer
-    CMSampleBufferRef sampleBuffer = NULL;
-    CMSampleTimingInfo timing = {
-        .duration = CMTimeMake(1, 30),
-        .presentationTimeStamp = pts,
-        .decodeTimeStamp = pts,
-    };
-    
-    CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault,
-                                       pixelBuffer,
-                                       YES,
-                                       NULL, NULL,
-                                       formatDesc,
-                                       &timing,
-                                       &sampleBuffer);
-    
-    if (formatDesc) CFRelease(formatDesc);
-    CVPixelBufferRelease(pixelBuffer);
-    
-    return sampleBuffer;
-}
-
-#pragma mark - Lifecycle
 
 - (void)start {
-    self.isRunning = YES;
-    self.startTime = CMTimeMakeWithSeconds(CACurrentMediaTime(), 1000000);
+    if (self.hasVideo) self.isRunning = YES;
 }
 
 - (void)stop {
     self.isRunning = NO;
+    dispatch_async(_decodeQueue, ^{ self->_clockActive = NO; });
 }
 
+- (CVPixelBufferRef)copyLatestPixelBuffer {
+    if (!self.isRunning) return NULL;
+    @synchronized (self) {
+        if (!self.isRunning || !_latest) return NULL;
+        return CVPixelBufferRetain(_latest);
+    }
+}
+
+- (void)dealloc {
+    if (_timer) dispatch_source_cancel(_timer);
+    [self closeReader];
+    [self clearLatest];
+}
 @end
