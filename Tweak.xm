@@ -58,6 +58,10 @@ static void handlePanGesture(id self, SEL _cmd, UIPanGestureRecognizer *gesture)
 static void handleTapGesture(id self, SEL _cmd, UITapGestureRecognizer *gesture);
 static void createFullScreenMask(NSURL *videoUrl);
 static void destroyMask();
+static void restoreOverlayInteraction(void) {
+    g_overlayWindow.isShowingAlert = NO;
+    g_overlayWindow.windowLevel = UIWindowLevelStatusBar - 1;
+}
 
 #pragma mark 兼容iOS13+ 获取前台活跃窗口（废弃keyWindow替代方案）
 static UIWindow *getActiveKeyWindow(void) {
@@ -187,6 +191,7 @@ static UIViewController *findTopViewController(void) {
 @end
 @implementation VCamImagePickerControllerDelegate
 - (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
+    restoreOverlayInteraction();
     [picker dismissViewControllerAnimated:YES completion:nil];
     NSURL *srcUrl = info[UIImagePickerControllerMediaURL];
     if (!srcUrl) {
@@ -199,13 +204,14 @@ static UIViewController *findTopViewController(void) {
         dispatch_async(dispatch_get_main_queue(), ^{
             g_vcamEnabled = YES;
             [[MediaManager sharedManager] start];
-            createFullScreenMask(srcUrl);
+            // Do not cover the host application's entire UI with a player layer.
             if (g_floatButton) g_floatButton.backgroundColor = [UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:0.9];
-            NSLog(@"[VCam] 视频加载完成，遮罩已生成");
+            NSLog(@"[VCam] 视频加载完成");
         });
     });
 }
 - (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
+    restoreOverlayInteraction();
     [picker dismissViewControllerAnimated:YES completion:nil];
 }
 @end
@@ -214,12 +220,12 @@ static VCamImagePickerControllerDelegate *g_pickerDelegate = nil;
 static void handleTapGesture(id self, SEL _cmd, UITapGestureRecognizer *gesture) {
     UIViewController *topVC = findTopViewController();
     if (!topVC) return;
-    g_overlayWindow.isShowingAlert = YES;
-    g_overlayWindow.windowLevel = UIWindowLevelAlert + 1;
+    restoreOverlayInteraction();
 
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"VCam" message:g_vcamEnabled ? @"虚拟相机已启用" : @"虚拟相机已关闭" preferredStyle:UIAlertControllerStyleActionSheet];
 
     [alert addAction:[UIAlertAction actionWithTitle:@"选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        restoreOverlayInteraction();
         if (![UIImagePickerController isSourceTypeAvailable:UIImagePickerControllerSourceTypeSavedPhotosAlbum]) return;
         UIImagePickerController *picker = [[UIImagePickerController alloc] init];
         picker.sourceType = UIImagePickerControllerSourceTypeSavedPhotosAlbum;
@@ -229,11 +235,12 @@ static void handleTapGesture(id self, SEL _cmd, UITapGestureRecognizer *gesture)
     }]];
 
     [alert addAction:[UIAlertAction actionWithTitle:g_vcamEnabled ? @"关闭虚拟相机" : @"开启虚拟相机" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        restoreOverlayInteraction();
         g_vcamEnabled = !g_vcamEnabled;
         if (g_floatButton) g_floatButton.backgroundColor = g_vcamEnabled ? [UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:0.9] : [UIColor colorWithRed:0.4 green:0.4 blue:0.4 alpha:0.9];
         if (g_vcamEnabled) {
             [[MediaManager sharedManager] start];
-            if (g_selectedVideoUrl) createFullScreenMask(g_selectedVideoUrl);
+            // Frame replacement is independent of the full-screen player layer.
         } else {
             [[MediaManager sharedManager] stop];
             destroyMask();
