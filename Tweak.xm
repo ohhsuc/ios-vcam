@@ -54,8 +54,8 @@ static AVPlayer *g_maskPlayer = nil;
 static NSURL *g_selectedVideoUrl = nil;
 
 static void setupFloatButton(void);
-static void handlePanGesture(UIPanGestureRecognizer *gesture);
-static void handleTapGesture(UITapGestureRecognizer *gesture);
+static void handlePanGesture(id self, SEL _cmd, UIPanGestureRecognizer *gesture);
+static void handleTapGesture(id self, SEL _cmd, UITapGestureRecognizer *gesture);
 static void createFullScreenMask(NSURL *videoUrl);
 static void destroyMask();
 
@@ -150,7 +150,7 @@ static void setupFloatButton() {
     class_addMethod([g_floatButton class], @selector(handleTap:), (IMP)handleTapGesture, "v@:@");
 }
 
-static void handlePanGesture(UIPanGestureRecognizer *gesture) {
+static void handlePanGesture(id self, SEL _cmd, UIPanGestureRecognizer *gesture) {
     UIView *btn = gesture.view;
     CGPoint translation = [gesture translationInView:btn.superview];
     btn.center = CGPointMake(btn.center.x + translation.x, btn.center.y + translation.y);
@@ -211,7 +211,7 @@ static UIViewController *findTopViewController(void) {
 @end
 static VCamImagePickerControllerDelegate *g_pickerDelegate = nil;
 
-static void handleTapGesture(UITapGestureRecognizer *gesture) {
+static void handleTapGesture(id self, SEL _cmd, UITapGestureRecognizer *gesture) {
     UIViewController *topVC = findTopViewController();
     if (!topVC) return;
     g_overlayWindow.isShowingAlert = YES;
