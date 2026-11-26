@@ -26,18 +26,6 @@
 }
 @end
 
-@interface VCamRootView : UIView
-@end
-@implementation VCamRootView
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    for (UIView *sub in self.subviews) {
-        CGPoint innerP = [self convertPoint:point toView:sub];
-        if ([sub pointInside:innerP withEvent:event]) return sub;
-    }
-    return nil;
-}
-@end
-
 @interface VCamFloatButton : UIButton
 @property (nonatomic, assign) CGPoint initialCenter;
 @end
@@ -52,15 +40,21 @@ static UIButton *g_floatButton = nil;
 static AVPlayerLayer *g_maskPlayerLayer = nil;
 static AVPlayer *g_maskPlayer = nil;
 static NSURL *g_selectedVideoUrl = nil;
+static __weak UIWindow *g_previousKeyWindow = nil;
+static UIView *g_menuView = nil;
 
 static void setupFloatButton(void);
 static void handlePanGesture(id self, SEL _cmd, UIPanGestureRecognizer *gesture);
 static void handleTapGesture(id self, SEL _cmd, UITapGestureRecognizer *gesture);
 static void destroyMask();
 static void restoreOverlayInteraction(void) {
+    [g_menuView removeFromSuperview];
+    g_menuView = nil;
     g_overlayWindow.isShowingAlert = NO;
     g_overlayWindow.windowLevel = UIWindowLevelStatusBar - 1;
     g_overlayWindow.hidden = NO;
+    if (g_previousKeyWindow && g_overlayWindow.isKeyWindow) [g_previousKeyWindow makeKeyWindow];
+    g_previousKeyWindow = nil;
 }
 
 #pragma mark 兼容iOS13+ 获取前台活跃窗口（废弃keyWindow替代方案）
@@ -101,13 +95,21 @@ static void setupFloatButton() {
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:g_floatButton action:@selector(handleTap:)];
     [g_floatButton addGestureRecognizer:tap];
 
-    g_overlayWindow = [[VCamOverlayWindow alloc] initWithFrame:screen];
+    UIWindowScene *activeScene = nil;
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]] && scene.activationState == UISceneActivationStateForegroundActive) {
+            activeScene = (UIWindowScene *)scene;
+            break;
+        }
+    }
+    g_overlayWindow = activeScene ? [[VCamOverlayWindow alloc] initWithWindowScene:activeScene] : [[VCamOverlayWindow alloc] initWithFrame:screen];
+    g_overlayWindow.frame = screen;
     g_overlayWindow.windowLevel = UIWindowLevelStatusBar - 1;
     g_overlayWindow.isShowingAlert = NO;
     g_overlayWindow.hidden = NO;
     g_overlayWindow.backgroundColor = [UIColor clearColor];
 
-    VCamRootView *rootView = [[VCamRootView alloc] initWithFrame:g_overlayWindow.bounds];
+    UIView *rootView = [[UIView alloc] initWithFrame:g_overlayWindow.bounds];
     rootView.backgroundColor = [UIColor clearColor];
     [rootView addSubview:g_floatButton];
     UIViewController *rootVC = [[UIViewController alloc] init];
@@ -132,31 +134,12 @@ static void handlePanGesture(id self, SEL _cmd, UIPanGestureRecognizer *gesture)
     }
 }
 
-static UIViewController *findTopViewController(void) {
-    UIViewController *topVC = nil;
-    for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if (scene.activationState == UISceneActivationStateForegroundActive) {
-            for (UIWindow *w in scene.windows) {
-                if (w.isKeyWindow && w != g_overlayWindow) {
-                    topVC = w.rootViewController;
-                    break;
-                }
-            }
-        }
-    }
-    while (topVC && topVC.presentedViewController) {
-        topVC = topVC.presentedViewController;
-    }
-    return topVC;
-}
-
 #pragma mark 相册选择代理
 @interface VCamImagePickerControllerDelegate : NSObject <UINavigationControllerDelegate, UIImagePickerControllerDelegate>
 @end
 @implementation VCamImagePickerControllerDelegate
 - (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
-    restoreOverlayInteraction();
-    [picker dismissViewControllerAnimated:YES completion:nil];
+    [picker dismissViewControllerAnimated:YES completion:^{ restoreOverlayInteraction(); }];
     NSURL *srcUrl = info[UIImagePickerControllerMediaURL];
     if (!srcUrl) {
         NSLog(@"[VCam] 未选择视频文件");
@@ -175,57 +158,90 @@ static UIViewController *findTopViewController(void) {
     });
 }
 - (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
-    restoreOverlayInteraction();
-    [picker dismissViewControllerAnimated:YES completion:nil];
+    [picker dismissViewControllerAnimated:YES completion:^{ restoreOverlayInteraction(); }];
 }
 @end
 static VCamImagePickerControllerDelegate *g_pickerDelegate = nil;
 
+static void openVideoPicker(void) {
+    [g_menuView removeFromSuperview];
+    g_menuView = nil;
+    UIViewController *presenter = g_overlayWindow.rootViewController;
+    if (!presenter || presenter.presentedViewController ||
+        ![UIImagePickerController isSourceTypeAvailable:UIImagePickerControllerSourceTypeSavedPhotosAlbum]) {
+        restoreOverlayInteraction();
+        return;
+    }
+    for (UIWindow *window in g_overlayWindow.windowScene.windows) {
+        if (window != g_overlayWindow && window.isKeyWindow) {
+            g_previousKeyWindow = window;
+            break;
+        }
+    }
+    [g_overlayWindow makeKeyAndVisible];
+    UIImagePickerController *picker = [[UIImagePickerController alloc] init];
+    picker.sourceType = UIImagePickerControllerSourceTypeSavedPhotosAlbum;
+    picker.mediaTypes = @[@"public.movie"];
+    picker.modalPresentationStyle = UIModalPresentationFullScreen;
+    picker.delegate = g_pickerDelegate;
+    [presenter presentViewController:picker animated:YES completion:nil];
+}
+
 static void handleTapGesture(id self, SEL _cmd, UITapGestureRecognizer *gesture) {
-    UIViewController *topVC = findTopViewController();
-    if (!topVC || topVC.isBeingDismissed || topVC.isBeingPresented) return;
-    g_overlayWindow.hidden = YES;
+    if (g_menuView || g_overlayWindow.rootViewController.presentedViewController) return;
+    UIView *root = g_overlayWindow.rootViewController.view;
+    if (!root) return;
+    g_overlayWindow.isShowingAlert = YES;
+    g_overlayWindow.windowLevel = UIWindowLevelAlert + 1;
 
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"VCam" message:g_vcamEnabled ? @"虚拟相机已启用" : @"虚拟相机已关闭" preferredStyle:UIAlertControllerStyleAlert];
+    UIView *backdrop = [[UIView alloc] initWithFrame:root.bounds];
+    backdrop.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    backdrop.backgroundColor = [UIColor colorWithWhite:0 alpha:0.35];
+    backdrop.layer.zPosition = 10000;
+    g_menuView = backdrop;
+    [root addSubview:backdrop];
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        if (![UIImagePickerController isSourceTypeAvailable:UIImagePickerControllerSourceTypeSavedPhotosAlbum]) {
-            restoreOverlayInteraction();
-            return;
-        }
-        UIImagePickerController *picker = [[UIImagePickerController alloc] init];
-        picker.sourceType = UIImagePickerControllerSourceTypeSavedPhotosAlbum;
-        picker.mediaTypes = @[@"public.movie"];
-        picker.delegate = g_pickerDelegate;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            UIViewController *presenter = findTopViewController();
-            if (!presenter || presenter.isBeingDismissed || presenter.isBeingPresented || [presenter isKindOfClass:[UIAlertController class]]) {
+    UIStackView *panel = [[UIStackView alloc] init];
+    panel.axis = UILayoutConstraintAxisVertical;
+    panel.spacing = 8;
+    panel.layoutMargins = UIEdgeInsetsMake(16, 16, 16, 16);
+    panel.layoutMarginsRelativeArrangement = YES;
+    panel.backgroundColor = [UIColor secondarySystemBackgroundColor];
+    panel.layer.cornerRadius = 16;
+    panel.translatesAutoresizingMaskIntoConstraints = NO;
+    [backdrop addSubview:panel];
+    [NSLayoutConstraint activateConstraints:@[
+        [panel.centerXAnchor constraintEqualToAnchor:backdrop.centerXAnchor],
+        [panel.centerYAnchor constraintEqualToAnchor:backdrop.centerYAnchor],
+        [panel.widthAnchor constraintEqualToConstant:260]
+    ]];
+
+    UILabel *title = [[UILabel alloc] init];
+    title.text = g_vcamEnabled ? @"VCam · 已启用" : @"VCam · 已关闭";
+    title.textAlignment = NSTextAlignmentCenter;
+    title.textColor = [UIColor labelColor];
+    [panel addArrangedSubview:title];
+
+    NSArray<NSString *> *titles = @[@"选择视频", g_vcamEnabled ? @"关闭虚拟相机" : @"开启虚拟相机", @"取消"];
+    for (NSUInteger i = 0; i < titles.count; i++) {
+        UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+        [button setTitle:titles[i] forState:UIControlStateNormal];
+        [button.heightAnchor constraintEqualToConstant:44].active = YES;
+        [button addAction:[UIAction actionWithHandler:^(__kindof UIAction *action) {
+            if (i == 0) {
+                openVideoPicker();
+            } else {
                 restoreOverlayInteraction();
-                return;
+                if (i == 1) {
+                    g_vcamEnabled = !g_vcamEnabled;
+                    if (g_floatButton) g_floatButton.backgroundColor = g_vcamEnabled ? [UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:0.9] : [UIColor colorWithRed:0.4 green:0.4 blue:0.4 alpha:0.9];
+                    if (g_vcamEnabled) [[MediaManager sharedManager] start];
+                    else { [[MediaManager sharedManager] stop]; destroyMask(); }
+                }
             }
-            [presenter presentViewController:picker animated:YES completion:nil];
-        });
-    }]];
-
-    [alert addAction:[UIAlertAction actionWithTitle:g_vcamEnabled ? @"关闭虚拟相机" : @"开启虚拟相机" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        restoreOverlayInteraction();
-        g_vcamEnabled = !g_vcamEnabled;
-        if (g_floatButton) g_floatButton.backgroundColor = g_vcamEnabled ? [UIColor colorWithRed:0.2 green:0.8 blue:0.4 alpha:0.9] : [UIColor colorWithRed:0.4 green:0.4 blue:0.4 alpha:0.9];
-        if (g_vcamEnabled) {
-            [[MediaManager sharedManager] start];
-            // Frame replacement is independent of the full-screen player layer.
-        } else {
-            [[MediaManager sharedManager] stop];
-            destroyMask();
-        }
-        NSLog(@"[VCam] 虚拟相机开关切换：%d", g_vcamEnabled);
-    }]];
-
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
-        restoreOverlayInteraction();
-    }]];
-
-    [topVC presentViewController:alert animated:YES completion:nil];
+        }] forControlEvents:UIControlEventTouchUpInside];
+        [panel addArrangedSubview:button];
+    }
 }
 
 #pragma mark Hook分组（无私有框架）
