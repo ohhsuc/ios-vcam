@@ -56,7 +56,6 @@ static NSURL *g_selectedVideoUrl = nil;
 static void setupFloatButton(void);
 static void handlePanGesture(id self, SEL _cmd, UIPanGestureRecognizer *gesture);
 static void handleTapGesture(id self, SEL _cmd, UITapGestureRecognizer *gesture);
-static void createFullScreenMask(NSURL *videoUrl);
 static void destroyMask();
 static void restoreOverlayInteraction(void) {
     g_overlayWindow.isShowingAlert = NO;
@@ -64,42 +63,6 @@ static void restoreOverlayInteraction(void) {
 }
 
 #pragma mark 兼容iOS13+ 获取前台活跃窗口（废弃keyWindow替代方案）
-static UIWindow *getActiveKeyWindow(void) {
-    UIWindow *targetWin = nil;
-    for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if (scene.activationState == UISceneActivationStateForegroundActive) {
-            for (UIWindow *win in scene.windows) {
-                if (win.isKeyWindow && win.isHidden == NO) {
-                    targetWin = win;
-                    break;
-                }
-            }
-            if (targetWin) break;
-        }
-    }
-    return targetWin;
-}
-
-static void createFullScreenMask(NSURL *videoUrl) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        destroyMask();
-        AVPlayerItem *item = [AVPlayerItem playerItemWithURL:videoUrl];
-        g_maskPlayer = [AVPlayer playerWithPlayerItem:item];
-        g_maskPlayer.actionAtItemEnd = AVPlayerActionAtItemEndNone;
-        [g_maskPlayer play];
-        
-        g_maskPlayerLayer = [AVPlayerLayer playerLayerWithPlayer:g_maskPlayer];
-        UIWindow *keyWin = getActiveKeyWindow();
-        if (!keyWin) return;
-        
-        g_maskPlayerLayer.frame = keyWin.bounds;
-        g_maskPlayerLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
-        g_maskPlayerLayer.zPosition = 9998;
-        [keyWin.layer addSublayer:g_maskPlayerLayer];
-        NSLog(@"[VCam] 全屏视频遮罩创建完成，覆盖相机预览");
-    });
-}
-
 static void destroyMask() {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (g_maskPlayer) {
