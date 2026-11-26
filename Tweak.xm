@@ -327,39 +327,84 @@ static void setupOverlay(void) {
 }
 
 - (CMSampleBufferRef)copyReplacementFor:(CMSampleBufferRef)original CF_RETURNS_RETAINED {
+    if (!original || !CMSampleBufferIsValid(original) ||
+        !CMSampleBufferDataIsReady(original) || CMSampleBufferGetNumSamples(original) != 1) return NULL;
     CVPixelBufferRef incoming = CMSampleBufferGetImageBuffer(original);
-    if (!incoming) return NULL;
+    CMVideoFormatDescriptionRef desc = CMSampleBufferGetFormatDescription(original);
+    if (!incoming || !desc || CMFormatDescriptionGetMediaType(desc) != kCMMediaType_Video) return NULL;
     CVPixelBufferRef source = [[MediaManager sharedManager] copyLatestPixelBuffer];
     if (!source) return NULL;
+
     CVPixelBufferRef output = NULL;
     size_t width = CVPixelBufferGetWidth(incoming), height = CVPixelBufferGetHeight(incoming);
     OSType format = CVPixelBufferGetPixelFormatType(incoming);
-    if (CVPixelBufferGetWidth(source)==width && CVPixelBufferGetHeight(source)==height &&
-        CVPixelBufferGetPixelFormatType(source)==format) {
-        output = CVPixelBufferRetain(source);
-    } else if (@available(iOS 16.0, *)) {
-        if (!_transfer && VTPixelTransferSessionCreate(kCFAllocatorDefault,&_transfer)==noErr) {
-            VTSessionSetProperty(_transfer,kVTPixelTransferPropertyKey_ScalingMode,kVTScalingMode_CropSourceToCleanAperture);
+    if (!_transfer) {
+        OSStatus status = VTPixelTransferSessionCreate(kCFAllocatorDefault, &_transfer);
+        if (status == noErr && _transfer) {
+            VTSessionSetProperty(_transfer, kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_CropSourceToCleanAperture);
         }
-        NSDictionary *attrs = @{(__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey:@{}};
-        if (_transfer && CVPixelBufferCreate(kCFAllocatorDefault,width,height,format,(__bridge CFDictionaryRef)attrs,&output)==kCVReturnSuccess) {
-            if (VTPixelTransferSessionTransferImage(_transfer,source,output)!=noErr) {
-                CVPixelBufferRelease(output);
-                output = NULL;
-            }
+    }
+    NSDictionary *attrs = @{(__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey:@{}};
+    if (_transfer && CVPixelBufferCreate(kCFAllocatorDefault, width, height, format,
+                                         (__bridge CFDictionaryRef)attrs, &output) == kCVReturnSuccess && output) {
+        // Preserve buffer-level format/colour attachments on a fresh destination.
+        const CVAttachmentMode cvModes[] = {kCVAttachmentMode_ShouldPropagate, kCVAttachmentMode_ShouldNotPropagate};
+        for (CVAttachmentMode mode : cvModes) {
+            CFDictionaryRef values = CVBufferCopyAttachments(incoming, mode);
+            if (values) { CVBufferSetAttachments(output, values, mode); CFRelease(values); }
+        }
+        if (VTPixelTransferSessionTransferImage(_transfer, source, output) != noErr) {
+            CVPixelBufferRelease(output);
+            output = NULL;
         }
     }
     CVPixelBufferRelease(source);
     if (!output) return NULL;
-    CMVideoFormatDescriptionRef desc = NULL;
-    CMSampleBufferRef sample = NULL;
-    CMSampleTimingInfo timing;
-    if (CMSampleBufferGetSampleTimingInfo(original,0,&timing)==noErr &&
-        CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault,output,&desc)==noErr) {
-        CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault,output,desc,&timing,&sample);
+
+    // Never pass a sample whose image buffer disagrees with its format description.
+    if (!CMVideoFormatDescriptionMatchesImageBuffer(desc, output)) {
+        CVPixelBufferRelease(output);
+        return NULL;
     }
-    if (desc) CFRelease(desc);
+    CMSampleTimingInfo timing;
+    CMSampleBufferRef sample = NULL;
+    OSStatus status = CMSampleBufferGetSampleTimingInfo(original, 0, &timing);
+    if (status == noErr) {
+        status = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, output, desc, &timing, &sample);
+    }
     CVPixelBufferRelease(output);
+    if (status != noErr || !sample) {
+        if (sample) CFRelease(sample);
+        return NULL;
+    }
+
+    // Keep both attachment modes, not just the propagating dictionary.
+    const CMAttachmentMode cmModes[] = {kCMAttachmentMode_ShouldPropagate, kCMAttachmentMode_ShouldNotPropagate};
+    for (CMAttachmentMode mode : cmModes) {
+        CFDictionaryRef values = CMCopyDictionaryOfAttachments(kCFAllocatorDefault, original, mode);
+        if (values) { CMSetAttachments(sample, values, mode); CFRelease(values); }
+    }
+    CFArrayRef originalAttachments = CMSampleBufferGetSampleAttachmentsArray(original, false);
+    if (originalAttachments && CFArrayGetCount(originalAttachments) > 0) {
+        CFArrayRef newAttachments = CMSampleBufferGetSampleAttachmentsArray(sample, true);
+        if (!newAttachments || CFArrayGetCount(newAttachments) != CFArrayGetCount(originalAttachments)) {
+            CFRelease(sample);
+            return NULL;
+        }
+        for (CFIndex i = 0; i < CFArrayGetCount(originalAttachments); i++) {
+            NSDictionary *from = (__bridge NSDictionary *)CFArrayGetValueAtIndex(originalAttachments, i);
+            NSMutableDictionary *to = (__bridge NSMutableDictionary *)CFArrayGetValueAtIndex(newAttachments, i);
+            if (from && to) [to addEntriesFromDictionary:from];
+        }
+    }
+    CMTime outputPTS = CMSampleBufferGetOutputPresentationTimeStamp(original);
+    if (CMTIME_IS_VALID(outputPTS) && CMTIME_IS_NUMERIC(outputPTS)) {
+        CMSampleBufferSetOutputPresentationTimeStamp(sample, outputPTS);
+    }
+    if (!CMSampleBufferIsValid(sample) || !CMSampleBufferDataIsReady(sample)) {
+        CFRelease(sample);
+        return NULL;
+    }
     return sample;
 }
 
