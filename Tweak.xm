@@ -8,6 +8,32 @@
 #import <VideoToolbox/VTPixelTransferProperties.h>
 #import <objc/runtime.h>
 #import "MediaManager.h"
+#include <atomic>
+
+// Diagnostic counters only: do not change frame processing or retain camera images.
+enum VCamDiagnosticReason { VCamNoAttempt, VCamInvalidOriginal, VCamNoImage, VCamNoSource, VCamTransferFailed, VCamFormatMismatch, VCamSampleCreationFailed, VCamAttachmentMismatch, VCamInvalidReplacement, VCamReplacementReady };
+static std::atomic<unsigned long long> g_callbackCount{0}, g_activeCount{0}, g_replacedCount{0}, g_fallbackCount{0};
+static std::atomic<int> g_lastReason{VCamNoAttempt};
+static CMSampleBufferRef diagnosticFailure(VCamDiagnosticReason reason) {
+    g_lastReason.store(reason, std::memory_order_relaxed);
+    return NULL;
+}
+static NSString *diagnosticSummary(void) {
+    NSString *reason;
+    switch (g_lastReason.load(std::memory_order_relaxed)) {
+        case VCamInvalidOriginal: reason = @"原始帧无效"; break;
+        case VCamNoImage: reason = @"原始图像或格式缺失"; break;
+        case VCamNoSource: reason = @"解码帧尚未就绪"; break;
+        case VCamTransferFailed: reason = @"像素转换失败"; break;
+        case VCamFormatMismatch: reason = @"格式描述不匹配"; break;
+        case VCamSampleCreationFailed: reason = @"SampleBuffer 创建失败"; break;
+        case VCamAttachmentMismatch: reason = @"附加信息数量不匹配"; break;
+        case VCamInvalidReplacement: reason = @"替换帧无效"; break;
+        case VCamReplacementReady: reason = @"替换帧已生成"; break;
+        default: reason = @"尚无替换尝试"; break;
+    }
+    return [NSString stringWithFormat:@"回调 %llu · 启用时 %llu\n替换 %llu · 回退 %llu\n%@", g_callbackCount.load(std::memory_order_relaxed), g_activeCount.load(std::memory_order_relaxed), g_replacedCount.load(std::memory_order_relaxed), g_fallbackCount.load(std::memory_order_relaxed), reason];
+}
 
 #pragma mark - Isolated user interface
 @interface VCamOverlayWindow : UIWindow
@@ -170,6 +196,13 @@ static NSArray<UIWindow *> *windowsForOverlay(UIWindow *overlay) {
     label.text = detail.length ? [NSString stringWithFormat:@"VCam · %@\n%@",state,detail] :
         [NSString stringWithFormat:@"VCam · %@",state];
     [panel addArrangedSubview:label];
+    UILabel *diagnostic = [[UILabel alloc] init];
+    diagnostic.numberOfLines = 0;
+    diagnostic.textAlignment = NSTextAlignmentCenter;
+    diagnostic.textColor = UIColor.secondaryLabelColor;
+    diagnostic.font = [UIFont systemFontOfSize:12];
+    diagnostic.text = diagnosticSummary();
+    [panel addArrangedSubview:diagnostic];
 
     [self addButton:self.importing ? @"取消导入" : @"选择视频" selector:self.importing ? @selector(cancelImport:) : @selector(selectVideo:) to:panel enabled:YES];
     [self addButton:manager.isRunning ? @"关闭虚拟相机" : @"开启虚拟相机" selector:@selector(toggleVideo:) to:panel enabled:!self.importing && manager.hasVideo];
@@ -328,12 +361,12 @@ static void setupOverlay(void) {
 
 - (CMSampleBufferRef)copyReplacementFor:(CMSampleBufferRef)original CF_RETURNS_RETAINED {
     if (!original || !CMSampleBufferIsValid(original) ||
-        !CMSampleBufferDataIsReady(original) || CMSampleBufferGetNumSamples(original) != 1) return NULL;
+        !CMSampleBufferDataIsReady(original) || CMSampleBufferGetNumSamples(original) != 1) return diagnosticFailure(VCamInvalidOriginal);
     CVPixelBufferRef incoming = CMSampleBufferGetImageBuffer(original);
     CMVideoFormatDescriptionRef desc = CMSampleBufferGetFormatDescription(original);
-    if (!incoming || !desc || CMFormatDescriptionGetMediaType(desc) != kCMMediaType_Video) return NULL;
+    if (!incoming || !desc || CMFormatDescriptionGetMediaType(desc) != kCMMediaType_Video) return diagnosticFailure(VCamNoImage);
     CVPixelBufferRef source = [[MediaManager sharedManager] copyLatestPixelBuffer];
-    if (!source) return NULL;
+    if (!source) return diagnosticFailure(VCamNoSource);
 
     CVPixelBufferRef output = NULL;
     size_t width = CVPixelBufferGetWidth(incoming), height = CVPixelBufferGetHeight(incoming);
@@ -359,12 +392,12 @@ static void setupOverlay(void) {
         }
     }
     CVPixelBufferRelease(source);
-    if (!output) return NULL;
+    if (!output) return diagnosticFailure(VCamTransferFailed);
 
     // Never pass a sample whose image buffer disagrees with its format description.
     if (!CMVideoFormatDescriptionMatchesImageBuffer(desc, output)) {
         CVPixelBufferRelease(output);
-        return NULL;
+        return diagnosticFailure(VCamFormatMismatch);
     }
     CMSampleTimingInfo timing;
     CMSampleBufferRef sample = NULL;
@@ -375,7 +408,7 @@ static void setupOverlay(void) {
     CVPixelBufferRelease(output);
     if (status != noErr || !sample) {
         if (sample) CFRelease(sample);
-        return NULL;
+        return diagnosticFailure(VCamSampleCreationFailed);
     }
 
     // Keep both attachment modes, not just the propagating dictionary.
@@ -389,7 +422,7 @@ static void setupOverlay(void) {
         CFArrayRef newAttachments = CMSampleBufferGetSampleAttachmentsArray(sample, true);
         if (!newAttachments || CFArrayGetCount(newAttachments) != CFArrayGetCount(originalAttachments)) {
             CFRelease(sample);
-            return NULL;
+            return diagnosticFailure(VCamAttachmentMismatch);
         }
         for (CFIndex i = 0; i < CFArrayGetCount(originalAttachments); i++) {
             NSDictionary *from = (__bridge NSDictionary *)CFArrayGetValueAtIndex(originalAttachments, i);
@@ -403,15 +436,23 @@ static void setupOverlay(void) {
     }
     if (!CMSampleBufferIsValid(sample) || !CMSampleBufferDataIsReady(sample)) {
         CFRelease(sample);
-        return NULL;
+        return diagnosticFailure(VCamInvalidReplacement);
     }
+    g_lastReason.store(VCamReplacementReady, std::memory_order_relaxed);
     return sample;
 }
 
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection {
     id<AVCaptureVideoDataOutputSampleBufferDelegate> target = self.target;
     if (![target respondsToSelector:_cmd]) return;
-    CMSampleBufferRef replacement = [self copyReplacementFor:sampleBuffer];
+    g_callbackCount.fetch_add(1, std::memory_order_relaxed);
+    CMSampleBufferRef replacement = NULL;
+    if ([MediaManager sharedManager].isRunning) {
+        g_activeCount.fetch_add(1, std::memory_order_relaxed);
+        replacement = [self copyReplacementFor:sampleBuffer];
+        if (replacement) g_replacedCount.fetch_add(1, std::memory_order_relaxed);
+        else g_fallbackCount.fetch_add(1, std::memory_order_relaxed);
+    }
     @try {
         [target captureOutput:output didOutputSampleBuffer:replacement ?: sampleBuffer fromConnection:connection];
     } @finally {
