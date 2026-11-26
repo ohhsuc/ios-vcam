@@ -60,6 +60,7 @@ static void destroyMask();
 static void restoreOverlayInteraction(void) {
     g_overlayWindow.isShowingAlert = NO;
     g_overlayWindow.windowLevel = UIWindowLevelStatusBar - 1;
+    g_overlayWindow.hidden = NO;
 }
 
 #pragma mark 兼容iOS13+ 获取前台活跃窗口（废弃keyWindow替代方案）
@@ -136,7 +137,7 @@ static UIViewController *findTopViewController(void) {
     for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
         if (scene.activationState == UISceneActivationStateForegroundActive) {
             for (UIWindow *w in scene.windows) {
-                if (w.isKeyWindow) {
+                if (w.isKeyWindow && w != g_overlayWindow) {
                     topVC = w.rootViewController;
                     break;
                 }
@@ -182,19 +183,28 @@ static VCamImagePickerControllerDelegate *g_pickerDelegate = nil;
 
 static void handleTapGesture(id self, SEL _cmd, UITapGestureRecognizer *gesture) {
     UIViewController *topVC = findTopViewController();
-    if (!topVC) return;
-    restoreOverlayInteraction();
+    if (!topVC || topVC.isBeingDismissed || topVC.isBeingPresented) return;
+    g_overlayWindow.hidden = YES;
 
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"VCam" message:g_vcamEnabled ? @"虚拟相机已启用" : @"虚拟相机已关闭" preferredStyle:UIAlertControllerStyleActionSheet];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"VCam" message:g_vcamEnabled ? @"虚拟相机已启用" : @"虚拟相机已关闭" preferredStyle:UIAlertControllerStyleAlert];
 
     [alert addAction:[UIAlertAction actionWithTitle:@"选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        restoreOverlayInteraction();
-        if (![UIImagePickerController isSourceTypeAvailable:UIImagePickerControllerSourceTypeSavedPhotosAlbum]) return;
+        if (![UIImagePickerController isSourceTypeAvailable:UIImagePickerControllerSourceTypeSavedPhotosAlbum]) {
+            restoreOverlayInteraction();
+            return;
+        }
         UIImagePickerController *picker = [[UIImagePickerController alloc] init];
         picker.sourceType = UIImagePickerControllerSourceTypeSavedPhotosAlbum;
         picker.mediaTypes = @[@"public.movie"];
         picker.delegate = g_pickerDelegate;
-        [topVC presentViewController:picker animated:YES completion:nil];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UIViewController *presenter = findTopViewController();
+            if (!presenter || presenter.isBeingDismissed || presenter.isBeingPresented || [presenter isKindOfClass:[UIAlertController class]]) {
+                restoreOverlayInteraction();
+                return;
+            }
+            [presenter presentViewController:picker animated:YES completion:nil];
+        });
     }]];
 
     [alert addAction:[UIAlertAction actionWithTitle:g_vcamEnabled ? @"关闭虚拟相机" : @"开启虚拟相机" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
@@ -212,14 +222,9 @@ static void handleTapGesture(id self, SEL _cmd, UITapGestureRecognizer *gesture)
     }]];
 
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
-        g_overlayWindow.isShowingAlert = NO;
-        g_overlayWindow.windowLevel = UIWindowLevelStatusBar - 1;
+        restoreOverlayInteraction();
     }]];
 
-    if (alert.popoverPresentationController) {
-        alert.popoverPresentationController.sourceView = gesture.view;
-        alert.popoverPresentationController.sourceRect = gesture.view.bounds;
-    }
     [topVC presentViewController:alert animated:YES completion:nil];
 }
 
