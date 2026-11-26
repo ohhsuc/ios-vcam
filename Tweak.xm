@@ -380,12 +380,9 @@ static void setupOverlay(void) {
     NSDictionary *attrs = @{(__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey:@{}};
     if (_transfer && CVPixelBufferCreate(kCFAllocatorDefault, width, height, format,
                                          (__bridge CFDictionaryRef)attrs, &output) == kCVReturnSuccess && output) {
-        // Preserve buffer-level format/colour attachments on a fresh destination.
-        const CVAttachmentMode cvModes[] = {kCVAttachmentMode_ShouldPropagate, kCVAttachmentMode_ShouldNotPropagate};
-        for (CVAttachmentMode mode : cvModes) {
-            CFDictionaryRef values = CVBufferCopyAttachments(incoming, mode);
-            if (values) { CVBufferSetAttachments(output, values, mode); CFRelease(values); }
-        }
+        // VideoToolbox may replace the destination's attachments during transfer.
+        // Keep the generated buffer's real format description rather than attaching
+        // a description that does not match its actual memory layout.
         if (VTPixelTransferSessionTransferImage(_transfer, source, output) != noErr) {
             CVPixelBufferRelease(output);
             output = NULL;
@@ -394,17 +391,31 @@ static void setupOverlay(void) {
     CVPixelBufferRelease(source);
     if (!output) return diagnosticFailure(VCamTransferFailed);
 
-    // Never pass a sample whose image buffer disagrees with its format description.
-    if (!CMVideoFormatDescriptionMatchesImageBuffer(desc, output)) {
+    // The destination can have different row alignment and colour metadata.
+    // Derive its description from the actual buffer when the original is not
+    // compatible. Keep the original sample-level attachments below.
+    if (CVPixelBufferGetWidth(output) != width || CVPixelBufferGetHeight(output) != height ||
+        CVPixelBufferGetPixelFormatType(output) != format) {
         CVPixelBufferRelease(output);
         return diagnosticFailure(VCamFormatMismatch);
+    }
+    CMVideoFormatDescriptionRef generated = NULL;
+    if (!CMVideoFormatDescriptionMatchesImageBuffer(desc, output)) {
+        OSStatus formatStatus = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, output, &generated);
+        if (formatStatus != noErr || !generated ||
+            !CMVideoFormatDescriptionMatchesImageBuffer(generated, output)) {
+            if (generated) CFRelease(generated);
+            CVPixelBufferRelease(output);
+            return diagnosticFailure(VCamFormatMismatch);
+        }
     }
     CMSampleTimingInfo timing;
     CMSampleBufferRef sample = NULL;
     OSStatus status = CMSampleBufferGetSampleTimingInfo(original, 0, &timing);
     if (status == noErr) {
-        status = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, output, desc, &timing, &sample);
+        status = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, output, generated ?: desc, &timing, &sample);
     }
+    if (generated) CFRelease(generated);
     CVPixelBufferRelease(output);
     if (status != noErr || !sample) {
         if (sample) CFRelease(sample);
