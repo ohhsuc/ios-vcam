@@ -9,11 +9,20 @@
 #import <objc/runtime.h>
 #import "MediaManager.h"
 #include <atomic>
+#import <QuartzCore/QuartzCore.h>
 
 // Diagnostic counters only: do not change frame processing or retain camera images.
 enum VCamDiagnosticReason { VCamNoAttempt, VCamInvalidOriginal, VCamNoImage, VCamNoSource, VCamTransferFailed, VCamFormatMismatch, VCamSampleCreationFailed, VCamAttachmentMismatch, VCamInvalidReplacement, VCamReplacementReady };
 static std::atomic<unsigned long long> g_callbackCount{0}, g_activeCount{0}, g_replacedCount{0}, g_fallbackCount{0};
 static std::atomic<int> g_lastReason{VCamNoAttempt};
+static std::atomic<unsigned long long> g_processingUS{0}, g_processingCount{0}, g_peakUS{0}, g_poolLimitCount{0};
+static void recordProcessingTime(CFTimeInterval started) {
+    unsigned long long us = (unsigned long long)(MAX(0.0, CACurrentMediaTime() - started) * 1000000.0);
+    g_processingUS.fetch_add(us, std::memory_order_relaxed);
+    g_processingCount.fetch_add(1, std::memory_order_relaxed);
+    unsigned long long peak = g_peakUS.load(std::memory_order_relaxed);
+    while (peak < us && !g_peakUS.compare_exchange_weak(peak, us, std::memory_order_relaxed)) {}
+}
 static CMSampleBufferRef diagnosticFailure(VCamDiagnosticReason reason) {
     g_lastReason.store(reason, std::memory_order_relaxed);
     return NULL;
@@ -32,7 +41,10 @@ static NSString *diagnosticSummary(void) {
         case VCamReplacementReady: reason = @"替换帧已生成"; break;
         default: reason = @"尚无替换尝试"; break;
     }
-    return [NSString stringWithFormat:@"回调 %llu · 启用时 %llu\n替换 %llu · 回退 %llu\n%@", g_callbackCount.load(std::memory_order_relaxed), g_activeCount.load(std::memory_order_relaxed), g_replacedCount.load(std::memory_order_relaxed), g_fallbackCount.load(std::memory_order_relaxed), reason];
+    unsigned long long count = g_processingCount.load(std::memory_order_relaxed);
+    double average = count ? (double)g_processingUS.load(std::memory_order_relaxed) / count / 1000.0 : 0.0;
+    NSString *performance = [NSString stringWithFormat:@"处理均值 %.2f ms · 峰值 %.2f ms\n缓冲池限额 %llu", average, (double)g_peakUS.load(std::memory_order_relaxed)/1000.0, g_poolLimitCount.load(std::memory_order_relaxed)];
+    return [NSString stringWithFormat:@"回调 %llu · 启用时 %llu\n替换 %llu · 回退 %llu\n%@\n%@", g_callbackCount.load(std::memory_order_relaxed), g_activeCount.load(std::memory_order_relaxed), g_replacedCount.load(std::memory_order_relaxed), g_fallbackCount.load(std::memory_order_relaxed), reason, performance];
 }
 
 #pragma mark - Isolated user interface
@@ -350,13 +362,52 @@ static void setupOverlay(void) {
 
 @implementation VCamVideoDelegate {
     VTPixelTransferSessionRef _transfer;
+    CVPixelBufferPoolRef _pixelPool;
+    size_t _poolWidth, _poolHeight;
+    OSType _poolFormat;
 }
 
 - (void)dealloc {
+    if (_pixelPool) CFRelease(_pixelPool);
     if (_transfer) {
         if (@available(iOS 16.0, *)) VTPixelTransferSessionInvalidate(_transfer);
         CFRelease(_transfer);
     }
+}
+
+// A pool belongs to one serial camera callback queue. Returned buffers retain
+// normal CoreVideo ownership; the pool does not recycle buffers still in use.
+- (CVPixelBufferRef)copyOutputBufferWithWidth:(size_t)width height:(size_t)height format:(OSType)format CF_RETURNS_RETAINED {
+    if (!_pixelPool || _poolWidth != width || _poolHeight != height || _poolFormat != format) {
+        if (_pixelPool) CFRelease(_pixelPool);
+        _pixelPool = NULL;
+        NSDictionary *poolAttrs = @{(__bridge NSString *)kCVPixelBufferPoolMinimumBufferCountKey:@3};
+        NSDictionary *pixelAttrs = @{
+            (__bridge NSString *)kCVPixelBufferWidthKey:@(width),
+            (__bridge NSString *)kCVPixelBufferHeightKey:@(height),
+            (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey:@(format),
+            (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey:@{}
+        };
+        CVReturn result = CVPixelBufferPoolCreate(kCFAllocatorDefault, (__bridge CFDictionaryRef)poolAttrs,
+                                                 (__bridge CFDictionaryRef)pixelAttrs, &_pixelPool);
+        if (result != kCVReturnSuccess || !_pixelPool) {
+            if (_pixelPool) CFRelease(_pixelPool);
+            _pixelPool = NULL;
+            return NULL;
+        }
+        _poolWidth = width; _poolHeight = height; _poolFormat = format;
+    }
+    NSDictionary *limit = @{(__bridge NSString *)kCVPixelBufferPoolAllocationThresholdKey:@8};
+    CVPixelBufferRef buffer = NULL;
+    CVReturn result = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(kCFAllocatorDefault, _pixelPool,
+                                                (__bridge CFDictionaryRef)limit, &buffer);
+    if (result != kCVReturnSuccess || !buffer) {
+        if (result == kCVReturnWouldExceedAllocationThreshold) g_poolLimitCount.fetch_add(1, std::memory_order_relaxed);
+        if (buffer) CVPixelBufferRelease(buffer);
+        return NULL;
+    }
+    CVBufferRemoveAllAttachments(buffer);
+    return buffer;
 }
 
 - (CMSampleBufferRef)copyReplacementFor:(CMSampleBufferRef)original CF_RETURNS_RETAINED {
@@ -377,9 +428,8 @@ static void setupOverlay(void) {
             VTSessionSetProperty(_transfer, kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_CropSourceToCleanAperture);
         }
     }
-    NSDictionary *attrs = @{(__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey:@{}};
-    if (_transfer && CVPixelBufferCreate(kCFAllocatorDefault, width, height, format,
-                                         (__bridge CFDictionaryRef)attrs, &output) == kCVReturnSuccess && output) {
+    if (_transfer) output = [self copyOutputBufferWithWidth:width height:height format:format];
+    if (output) {
         // VideoToolbox may replace the destination's attachments during transfer.
         // Keep the generated buffer's real format description rather than attaching
         // a description that does not match its actual memory layout.
@@ -460,7 +510,9 @@ static void setupOverlay(void) {
     CMSampleBufferRef replacement = NULL;
     if ([MediaManager sharedManager].isRunning) {
         g_activeCount.fetch_add(1, std::memory_order_relaxed);
+        CFTimeInterval started = CACurrentMediaTime();
         replacement = [self copyReplacementFor:sampleBuffer];
+        recordProcessingTime(started);
         if (replacement) g_replacedCount.fetch_add(1, std::memory_order_relaxed);
         else g_fallbackCount.fetch_add(1, std::memory_order_relaxed);
     }
