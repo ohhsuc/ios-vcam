@@ -86,10 +86,30 @@
     NSDictionary *settings = @{
         (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)
     };
-    // Apply the source's display transform for portrait/rotated clips.
-    if (!CGAffineTransformIsIdentity(track.preferredTransform)) {
+    // HDR needs color conversion during composition, not just 8-bit output.
+    // Leave ordinary SDR decoding and the playback clock unchanged.
+    BOOL hdr = [track hasMediaCharacteristic:AVMediaCharacteristicContainsHDRVideo];
+    if (!hdr) {
+        for (id entry in track.formatDescriptions) {
+            CMFormatDescriptionRef description = (__bridge CMFormatDescriptionRef)entry;
+            CFTypeRef transfer = CMFormatDescriptionGetExtension(description, kCMFormatDescriptionExtension_TransferFunction);
+            if (transfer && (CFEqual(transfer, kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG) ||
+                             CFEqual(transfer, kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ))) {
+                hdr = YES;
+                break;
+            }
+        }
+    }
+    // Also apply the source's display transform for portrait/rotated clips.
+    if (hdr || !CGAffineTransformIsIdentity(track.preferredTransform)) {
+        AVMutableVideoComposition *composition = [AVMutableVideoComposition videoCompositionWithPropertiesOfAsset:_asset];
+        if (hdr) {
+            composition.colorPrimaries = AVVideoColorPrimaries_ITU_R_709_2;
+            composition.colorTransferFunction = AVVideoTransferFunction_ITU_R_709_2;
+            composition.colorYCbCrMatrix = AVVideoYCbCrMatrix_ITU_R_709_2;
+        }
         AVAssetReaderVideoCompositionOutput *output = [[AVAssetReaderVideoCompositionOutput alloc] initWithVideoTracks:@[track] videoSettings:settings];
-        output.videoComposition = [AVMutableVideoComposition videoCompositionWithPropertiesOfAsset:_asset];
+        output.videoComposition = composition;
         _output = output;
     } else {
         _output = [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
