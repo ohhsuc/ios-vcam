@@ -18,3 +18,10 @@ The workflow supports manual dispatch in Actions → Build VCam → Run workflow
 - iOS 16+ VideoToolbox is used to convert common frame formats; hardware/format support must be tested.
 - No RTSP/RTMP/OBS, persistent selection, or global camera support. The old jailbreak settings bundle is not built; this fork has not validated the legacy deb installation path.
 - LiveContainer and iOS 27.2 compatibility is unverified.
+
+## Performance branch (experimental)
+- Per-output pixel-buffer pool, minimum count 3, allocation threshold 8. The pool is recreated on format or size changes; previously returned buffers remain owned by their consumers.
+- The camera menu reports cumulative mean/peak frame preparation time (excluding the host callback), allocation threshold events, replacements and fallbacks since process launch.
+- The original frame is forwarded if allocation or conversion fails, as before. A zero fallback count is a test target, not a guarantee. Test with non-sensitive scenes in an authorized test app.
+- Compare identical clips and device settings against main, including switching cameras, repeated start/stop, background/foreground, and sustained memory use. No benchmark results or on-device verification are claimed.
+- This branch does not alter source content, add random perturbations, or hide the plugin. Playback clock and decoding remain unchanged.
