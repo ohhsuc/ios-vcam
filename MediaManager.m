@@ -169,9 +169,8 @@
         if (!_pending) _pending = [_output copyNextSampleBuffer];
         if (!_pending) {
             if (_reader.status == AVAssetReaderStatusCompleted) {
-                NSError *error = nil;
-                if ([self primeReader:&error]) return;
-                self.lastError = error.localizedDescription ?: @"循环播放失败";
+                // Single playback: never silently restart a completed clip.
+                self.lastError = @"视频已播放完毕，已关闭虚拟相机；如需再次播放，请重新选择视频。";
             } else if (_reader.status == AVAssetReaderStatusFailed ||
                        _reader.status == AVAssetReaderStatusCancelled) {
                 self.lastError = _reader.error.localizedDescription ?: @"视频解码中断";
